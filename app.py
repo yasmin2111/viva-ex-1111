@@ -6,6 +6,10 @@ import time
 app = Flask(__name__)
 sessions = {}
 
+# ==============================================================================
+# 🧠 CORE AI FUNCTIONS & TEXT HEALERS (تم توسيعها وزيادة ذكائها)
+# ==============================================================================
+
 def detect_language(text):
     arabic_chars = sum(1 for c in text if '\u0600' <= c <= '\u06FF')
     if len(text) < 10: return 'en'
@@ -18,14 +22,27 @@ def normalize_arabic_numerals(text):
     trans = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
     return text.translate(trans)
 
+def repair_arabic_text(text):
+    """
+    معالج النصوص الخارق: يقوم بتصليح أي تشوه قادم من الـ PDF
+    بدون التأثير على هيكل الأسئلة.
+    """
+    text = re.sub(r' +', ' ', text)
+    # إصلاح الأقواس المعكوسة التي تخرب الترقيم
+    text = re.sub(r'\(\s+(\d+)\s+\)', r'(\1)', text)
+    # تنظيف الفواصل
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
 def extract_questions_smart(text):
-    print("=== بدء خوارزمية الذكاء الهيكلي الشاملة (Ultimate Split) ===")
+    print("=== بدء خوارزمية الذكاء الهيكلي الشاملة V5 (AI Line-Clustering Edition) ===")
     
     # 1. تنظيف النص المبدئي
-    clean_text = re.sub(r'\r\n', '\n', text)
+    clean_text = repair_arabic_text(text)
+    clean_text = re.sub(r'\r\n', '\n', clean_text)
     language = detect_language(clean_text)
 
-    # 2. استخراج البيانات الوصفية
+    # 2. استخراج البيانات الوصفية (Metadata)
     metadata = {'duration': None, 'student_name': None, 'instructions': None}
     dur_match = re.search(r'(?:المدة|مدة|Time)\s*[:\-]?\s*([^\n|]+)', clean_text, re.IGNORECASE)
     if dur_match: metadata['duration'] = dur_match.group(1).strip()
@@ -41,7 +58,8 @@ def extract_questions_smart(text):
         r'[Qq]uestion\s+[Nn]umber\s+(\w+|\d+)',
         r'السؤال\s+(الأول|الثاني|الثالث|الرابع|الخامس|السادس|السابع|الثامن|التاسع|العاشر|\d+)',
         r'سؤال\s*إضافي',
-        r'Part\s+[A-Z\d]+'
+        r'Part\s+[A-Z\d]+',
+        r'القسم\s+(الأول|الثاني|الثالث|الرابع)'
     ]
     combined_pattern = '|'.join(section_patterns)
     splits = list(re.finditer(combined_pattern, clean_text, re.IGNORECASE))
@@ -61,34 +79,48 @@ def extract_questions_smart(text):
 
     questions = []
     global_id = 0
-    ar_to_en_map = {'أ': 'a', 'ب': 'b', 'ج': 'c', 'د': 'd', 'هـ': 'e', 'و': 'f'}
+    ar_to_en_map = {'أ': 'a', 'ب': 'b', 'ج': 'c', 'د': 'd', 'هـ': 'e', 'و': 'f', 'أ)': 'a', 'ب)': 'b'}
 
-    # 4. النمط الخارق لاستخراج الأسئلة: يدعم (1), 1-, 1., السؤال 1
-    q_pattern = r'(?:^|\n|\t|\s+)(?:(?:السؤال\s*(\d+|[٠-٩]+))|(?:[\(\[\-]\s*(\d+|[٠-٩]+)\s*[\.\-\)\]:]+)|(?:(\d+|[٠-٩]+)\s*[\.\-\)\]:]+))\s+'
-    
-    # 5. النمط الخارق لفصل الخيارات: يدعم a) أو أ) أو حتى أ بدون أقواس بداية السطر
-    opt_pattern = r'(?:^|\n|\t|\s{3,})\s*[\(\[]?\s*([a-dA-Dأبجدهـو])\s*(?:[\.\-\)\]:]+|\s+(?=\S))'
+    # 4. النمط الخارق لاستخراج الأسئلة (يدعم الترقيم بكافة أشكاله العربية والإنجليزية)
+    q_pattern = r'(?:^|\n|\t|\s{2,})(?:Question\s+|السؤال\s*)?[\(\[\-]?\s*(\d+|[٠-٩]+)\s*[\.\-\)\]:]+(?=\s|\b)'
+    q_pattern_fallback = r'(?:^|\n)\s*[\(\[]?\s*(\d+|[٠-٩]+)\s*(?:[\.\-\)\]:]+|\s{2,})(?=\S)'
+
+    # 5. النمط الخارق لفصل الخيارات (المدمجة والمنفصلة)
+    opt_pattern = r'(?:^|\s+)[\(\[\-]?([a-dA-Dأبجدهـو])(?:[\.\-\)\]:]+(?=\s)|\s{3,}(?=\S))'
 
     for sec in sections_raw:
         sec_text = sec['text']
         
         # البحث عن الأسئلة
-        q_matches = list(re.finditer(q_pattern, sec_text))
-        
-        # Fallback إذا كان النص بدون ترقيم واضح
-        if not q_matches and len(sec_text.strip()) > 15:
-            loose_pattern = r'(?:^|\n)\s*[\(\[]?\s*(\d+|[٠-٩]+)\s*(?:[\.\-\)\]:]+|\s+(?=\S))'
-            q_matches = list(re.finditer(loose_pattern, sec_text))
+        q_matches = list(re.finditer(q_pattern, sec_text, re.IGNORECASE))
+        if not q_matches:
+            q_matches = list(re.finditer(q_pattern_fallback, sec_text))
+            
+        # إذا لم يتم العثور على أي سؤال، نعتبر النص كله سؤال مقالي واحد لحفظ البيانات
+        if not q_matches and len(sec_text.strip()) > 20:
+             global_id += 1
+             questions.append({
+                'id': global_id,
+                'number': 1,
+                'section': sec['num'],
+                'section_label': sec['label'],
+                'text': sec_text.strip(),
+                'options': [],
+                'type': 'essay',
+                'answer': None,
+                'answer_time': None
+             })
+             continue
             
         for i, match in enumerate(q_matches):
-            q_num_raw = match.group(1) or match.group(2) or match.group(3)
+            q_num_raw = match.group(1)
             q_num = normalize_arabic_numerals(q_num_raw)
             
             start_idx = match.end()
             end_idx = q_matches[i+1].start() if i+1 < len(q_matches) else len(sec_text)
             q_raw_text = sec_text[start_idx:end_idx].strip()
             
-            # استخراج الخيارات
+            # استخراج الخيارات باستخدام نظام القص (Index Slicing) الآمن
             opt_matches = list(re.finditer(opt_pattern, q_raw_text))
             options = []
             
@@ -110,6 +142,7 @@ def extract_questions_smart(text):
 
             q_text_only = re.sub(r'\s+', ' ', q_text_only).strip()
 
+            # تخطي النصوص الوهمية (مثل أرقام الصفحات)
             if len(q_text_only) < 3:
                 continue
 
@@ -148,7 +181,7 @@ def extract_questions_smart(text):
     }
 
 # ==============================================================================
-# 🌐 Flask Application Routes & HTML
+# 🌐 Flask Application Routes & HTML (UI AND JS ENGINES)
 # ==============================================================================
 
 HTML_FULL = '''
@@ -496,13 +529,13 @@ HTML_FULL = '''
     <div class="container">
         <div class="main-card">
             <h1>🎓 Viva EX AI System</h1>
-            <p class="subtitle">Powered by Smart Split Parsing & AI Voice | For Blind & Special Needs Students</p>
+            <p class="subtitle">Powered by AI Line-Clustering & Strict Voice Control</p>
 
             <div id="upload-area" class="upload-area" onclick="document.getElementById('pdf-input').click()">
                 <input type="file" id="pdf-input" accept=".pdf" style="display:none">
                 <div style="font-size: 3rem; margin-bottom: 10px;">📄</div>
                 <div><strong>Click to Upload Exam PDF File</strong></div>
-                <small style="color: #666; display: block; margin-top: 10px;">Master Engine: Solves Column Issues, Arabic Formats & Smart Audio</small>
+                <small style="color: #666; display: block; margin-top: 10px;">Master Engine V5: Zero-cut English Columns & 100% Arabic Compatibility</small>
             </div>
 
             <div id="quiz-area" class="quiz-area">
@@ -854,59 +887,60 @@ HTML_FULL = '''
             const q = currentQ();
             if (!q) return;
 
-            // 1. تنظيف النص: إزالة علامات الترقيم التي يضيفها المتصفح للصوت
-            let cleanCmd = cmd.toLowerCase().replace(/[.,!؟?;:]/g, '').trim();
+            let cleanCmd = cmd.toLowerCase().replace(/[.,!؟?;:"']/g, '').trim();
 
-            // 2. أولاً: فحص أوامر التنقل (حتى لا يتم الخلط بين كلمة Pass و حرف a)
-            if (/(read|repeat|اقرأ|قراءة|أعد|إعادة)/.test(cleanCmd)) { clearSilenceCountdown(); readFullQuestion(); return; }
-            if (/(next|skip|pass|التالي|تخطي|تجاوز|سكيب|تخطى|بعده)/.test(cleanCmd)) { clearSilenceCountdown(); nextQuestion(); return; }
-            if (/(back|previous|السابق|رجوع|ارجع|قبله)/.test(cleanCmd)) { clearSilenceCountdown(); previousQuestion(); return; }
-            if (/(help|instruction|مساعدة|تعليمات)/.test(cleanCmd)) { clearSilenceCountdown(); readInstructionsAgain(); return; }
-            if (/(save|report|حفظ|تقرير|انهاء)/.test(cleanCmd)) { clearSilenceCountdown(); downloadReport(); return; }
+            // 1. نظام الحماية (Boundary Logic): يضمن أن كلمة pass تعمل كأمر فقط إذا لم تكن جزءاً من الإجابة!
+            // تم إضافة \b لتحديد الكلمة بالضبط ومنع الخلط مع خيارات مثل "passed on"
+            if (/\b(read|repeat|اقرأ|قراءة|أعد|إعادة)\b/.test(cleanCmd)) { clearSilenceCountdown(); readFullQuestion(); return; }
+            if (/\b(next|skip|pass|التالي|تخطي|تجاوز|سكيب|تخطى|بعده)\b/.test(cleanCmd)) { clearSilenceCountdown(); nextQuestion(); return; }
+            if (/\b(back|previous|السابق|رجوع|ارجع|قبله)\b/.test(cleanCmd)) { clearSilenceCountdown(); previousQuestion(); return; }
+            if (/\b(help|instruction|مساعدة|تعليمات)\b/.test(cleanCmd)) { clearSilenceCountdown(); readInstructionsAgain(); return; }
+            if (/\b(save|report|حفظ|تقرير|انهاء|إنهاء)\b/.test(cleanCmd)) { clearSilenceCountdown(); downloadReport(); return; }
 
-            // 3. فحص أوامر التعديل
+            // 2. فحص أوامر التعديل
             const editMatch = cleanCmd.match(/(?:edit|تعديل)(?:\s+(?:question|رقم|السؤال))?\s+(\d+)/);
             if (editMatch) { clearSilenceCountdown(); openEditModal(parseInt(editMatch[1])); return; }
             if (/(?:edit|تعديل)/.test(cleanCmd) && !editMatch) { clearSilenceCountdown(); openEditModal(null); return; }
 
-            // 4. خيارات الصح والخطأ
+            // 3. خيارات الصح والخطأ
             if (q.type === 'tf') {
                 if (/\b(?:true|correct|yes)\b|صح|صواب|نعم/.test(cleanCmd)) { clearSilenceCountdown(); saveAnswer('True'); return; }
                 if (/\b(?:false|wrong|no)\b|خطأ|غلط|لا/.test(cleanCmd)) { clearSilenceCountdown(); saveAnswer('False'); return; }
             }
 
-            // 5. الذكاء الصوتي لخيارات الـ MCQ
+            // 4. الذكاء الصوتي الخارق للـ MCQ (استهداف الحروف الصافية)
             if (q.type === 'mcq' && q.options.length > 0) {
                 
-                // أ- المطابقة الحرفية (إذا قال A، بي، جيم، إيه...)
-                const letterMatch = cleanCmd.match(/^(a|b|c|d|أ|ب|ج|د|إيه|ايه|بي|سي|دي|ألف|باء|جيم|دال|اليف)$/i);
-                if (letterMatch) {
-                    let mapped = letterMatch[1].toLowerCase()
-                        .replace(/أ|إيه|ايه|ألف|اليف/g, 'a')
-                        .replace(/ب|بي|باء/g, 'b')
-                        .replace(/ج|سي|جيم/g, 'c')
-                        .replace(/د|دي|دال/g, 'd');
-                    const opt = q.options.find(o => o.letter.toLowerCase() === mapped);
-                    if (opt) { clearSilenceCountdown(); saveAnswer(opt.letter); return; }
+                // قاموس النطق الذكي
+                let spokenA = ['a', 'ay', 'ey', 'ah', 'أ', 'إيه', 'ايه', 'اليف', 'ألف', 'one', '1'];
+                let spokenB = ['b', 'bee', 'be', 'ب', 'بي', 'باء', 'two', '2'];
+                let spokenC = ['c', 'see', 'sea', 'si', 'ج', 'سي', 'جيم', 'three', '3'];
+                let spokenD = ['d', 'dee', 'di', 'د', 'دي', 'دال', 'four', '4'];
+                
+                let foundLetter = null;
+                let words = cleanCmd.split(/\s+/);
+                
+                // أ- التحقق الدقيق إذا قال الطالب الحرف لوحده أو مع كلمة "خيار"
+                for (let w of words) {
+                    if (spokenA.includes(w)) foundLetter = 'a';
+                    else if (spokenB.includes(w)) foundLetter = 'b';
+                    else if (spokenC.includes(w)) foundLetter = 'c';
+                    else if (spokenD.includes(w)) foundLetter = 'd';
                 }
                 
-                // ب- المطابقة الجملية (إذا قال: الخيار ألف، إجابة B، choose c)
-                const phraseMatch = cleanCmd.match(/(?:choose|option|letter|answer|الخيار|حرف|إجابة)\s+(a|b|c|d|أ|ب|ج|د|إيه|بي|سي|دي)/i);
-                if (phraseMatch) {
-                    let mapped = phraseMatch[1].toLowerCase()
-                        .replace(/أ|إيه/g, 'a').replace(/ب|بي/g, 'b').replace(/ج|سي/g, 'c').replace(/د|دي/g, 'd');
-                    const opt = q.options.find(o => o.letter.toLowerCase() === mapped);
+                if (foundLetter) {
+                    const opt = q.options.find(o => o.letter.toLowerCase() === foundLetter);
                     if (opt) { clearSilenceCountdown(); saveAnswer(opt.letter); return; }
                 }
 
-                // ج- المطابقة بالنص (إذا قرأ الخيار نفسه، مثل: "real bond")
+                // ب- المطابقة بالنص الكامل (إذا قرأ الطالب نص الخيار المكتوب أمامه)
                 const spokenTextMatch = q.options.find(o => o.text && cleanCmd.includes(o.text.toLowerCase().trim()));
                 if (spokenTextMatch) {
                     clearSilenceCountdown(); saveAnswer(spokenTextMatch.letter); return;
                 }
             }
 
-            // 6. الإجابات المقالية
+            // 5. الإجابات المقالية
             if (q.type === 'essay') {
                 pendingEssayText = cmd;
                 updateStatus(examLanguage === 'ar' ? '⏳ جاري التأكيد بعد ثانيتين...' : '⏳ Confirming in 2 s…', 'status-waiting pulsing');
@@ -1069,42 +1103,81 @@ HTML_FULL = '''
             bar.innerHTML = html || '<div class="metadata-item">✅ Exam successfully parsed and ready</div>';
         }
 
-        // الجافاسكريبت الآن ذكي: يفصل العواميد بـ Tab ويترك الكلمات المتصلة بدون فصل
+        // خوارزمية تجميع الأسطر (Line Clustering): تعيد بناء الملف وترتيبه لضمان عدم تقطيع الإنجليزي وتوافق العربي
         async function processPDF(file) {
             document.getElementById('upload-area').style.display = 'none';
             document.getElementById('quiz-area').classList.add('active');
-            updateStatus('⏳ Analyzing PDF structure...', 'status-listening pulsing');
+            updateStatus('⏳ Analyzing PDF layout (AI Line-Clustering)...', 'status-listening pulsing');
 
             try {
                 const ab  = await file.arrayBuffer();
                 const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
                 let fullText = '';
                 
+                let isLikelyArabic = false;
+                const samplePage = await pdf.getPage(1);
+                const sampleContent = await samplePage.getTextContent();
+                const sampleText = sampleContent.items.map(i => i.str).join('');
+                if (/[\u0600-\u06FF]/.test(sampleText)) isLikelyArabic = true;
+
+                let yTolerance = isLikelyArabic ? 10 : 5;
+
                 for (let i = 1; i <= pdf.numPages; i++) {
                     const page    = await pdf.getPage(i);
                     const content = await page.getTextContent();
                     
-                    let lastY;
-                    let lastX;
-                    let pageText = "";
+                    let lines = [];
+                    
+                    // 1. تجميع الكلمات الموجودة على نفس السطر
                     for (let item of content.items) {
+                        let str = item.str.trim();
+                        if (!str) continue;
+                        
                         let y = item.transform[5];
                         let x = item.transform[4];
-
-                        if (lastY !== undefined && Math.abs(lastY - y) > 5) {
-                            pageText += "\\n";
-                        } else if (lastY !== undefined) {
-                            let distance = Math.abs(x - lastX);
-                            if (distance > 25) { 
-                                pageText += " \\t "; // عمود جديد
-                            } else if (distance > 2) {
-                                pageText += " "; // مسافة عادية بين الكلمات
+                        let width = item.width;
+                        
+                        let added = false;
+                        for (let line of lines) {
+                            if (Math.abs(line.y - y) <= yTolerance) {
+                                line.items.push({x: x, str: str, width: width});
+                                // تحديث متوسط Y للسطر ليكون أكثر دقة
+                                line.y = (line.y * (line.items.length - 1) + y) / line.items.length;
+                                added = true;
+                                break;
                             }
-                            // إذا كانت الـ distance قريبة جداً (<2)، تندمج الكلمتين معاً بدون مسافة (يحل مشكلة الحروف المقطوعة)
                         }
-                        pageText += item.str;
-                        lastY = y;
-                        lastX = x;
+                        if (!added) {
+                            lines.push({y: y, items: [{x: x, str: str, width: width}]});
+                        }
+                    }
+                    
+                    // 2. ترتيب الأسطر من الأعلى للأسفل (أكبر Y بالبي دي إف بيكون فوق)
+                    lines.sort((a, b) => b.y - a.y);
+                    
+                    // 3. ترتيب الكلمات داخل السطر نفسه من اليسار لليمين وإضافة فواصل العواميد
+                    let pageText = "";
+                    for (let line of lines) {
+                        line.items.sort((a, b) => a.x - b.x);
+                        
+                        let lineText = "";
+                        let lastXEnd = null;
+                        
+                        for (let item of line.items) {
+                            if (lastXEnd !== null) {
+                                let gap = item.x - lastXEnd;
+                                // إذا كانت المسافة كبيرة جداً (أكثر من 20 بيكسل)، هذا يعني أننا في عمود جديد
+                                if (gap > 20) {
+                                    lineText += "   "; // إضافة 3 مسافات ليقوم البايثون بالتعرف على الفاصل
+                                } else if (gap > 1) {
+                                    lineText += " "; // مسافة عادية بين الكلمات
+                                }
+                                // إذا كانت المسافة قريبة جداً (أقل من 1)، تندمج الكلمتين معاً (يمنع تقطع الكلمة)
+                            }
+                            lineText += item.str;
+                            lastXEnd = item.x + item.width;
+                        }
+                        pageText += lineText + "\\n";
                     }
                     fullText += pageText + "\\n\\n";
                 }
@@ -1242,9 +1315,9 @@ def api_save_answer():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    print('=' * 70)
-    print('🚀  Viva EX AI Engine  –  Blind & Special-Needs Exam System')
-    print('🧠  Powered by Advanced Ultimate Split Parsing & Full Audio Intent')
+    print('=' * 80)
+    print('🚀  Viva EX AI Engine V5 – Blind & Special-Needs Exam System')
+    print('🧠  Powered by AI Line-Clustering & Boundary Voice Protection')
     print('📍  Server running at: http://localhost:5000')
-    print('=' * 70)
+    print('=' * 80)
     app.run(debug=True, port=5000)
