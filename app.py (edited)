@@ -1,0 +1,335 @@
+import os, re, json, time, uuid, threading, base64
+from flask import Flask, request, jsonify, render_template_string
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+# ==============================================================================
+# 🧠 VIVA EX AI ENGINE V5 - CORE CONFIGURATION
+# ==============================================================================
+
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    print("WARNING: GOOGLE_API_KEY not found in .env")
+
+app = Flask(__name__)
+# تخزين الجلسات في الذاكرة لتبسيط المثال
+sessions = {}
+
+def detect_language(text):
+    """كشف لغة النص بناءً على الحروف السائدة"""
+    arabic_chars = len(re.findall(r'[\u0600-\u06FF]', text))
+    english_chars = len(re.findall(r'[a-zA-Z]', text))
+    return 'ar' if arabic_chars > english_chars else 'en'
+
+def extract_questions_smart(raw_text):
+    """خوارزمية ريجيكس كحل بديل في حال فشل الذكاء الاصطناعي"""
+    clean_text = raw_text.replace('\r', '')
+    lang = detect_language(clean_text)
+    
+    # تبسيط الاستخراج للسرعة في الـ Fallback
+    q_pattern = r'(?:^|\n)(?:\d+|[أ-ي]+)[\.\-\)]\s*(.*?)(?=\n(?:\d+|[أ-ي]+)[\.\-\)]|$)'
+    matches = re.finditer(q_pattern, clean_text, re.DOTALL)
+    
+    questions = []
+    for i, m in enumerate(matches):
+        body = m.group(1).strip()
+        if not body: continue
+        questions.append({
+            'id': i + 1, 'number': i + 1, 'text': body, 'type': 'essay',
+            'options': [], 'section': 1, 'section_label': 'General Section',
+            'answer': None, 'answer_time': None
+        })
+        
+    return {
+        'questions': questions,
+        'metadata': {'duration': 'N/A', 'student_name': 'N/A', 'instructions': 'N/A'},
+        'language': lang,
+        'sections': ['General Section']
+    }
+
+# ==============================================================================
+# 🌐 Flask Application Routes & HTML (UI AND JS ENGINES)
+# ==============================================================================
+
+HTML_FULL = r'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Viva EX - Advanced Blind & Special Needs Exam System</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&family=Cairo:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root { --primary: #2563eb; --secondary: #1e40af; --accent: #f59e0b; --bg: #f8fafc; --card: #ffffff; }
+        body { font-family: 'Roboto', 'Cairo', sans-serif; background: #2563eb; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; overflow-x: hidden; }
+        .container { width: 95%; max-width: 1200px; background: var(--card); border-radius: 30px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); min-height: 80vh; padding: 40px; position: relative; }
+        .header { text-align: center; margin-bottom: 40px; }
+        .header h1 { color: var(--primary); font-size: 2.5rem; margin: 0; }
+        .upload-area { border: 3px dashed #2196F3; border-radius: 20px; padding: 60px; text-align: center; cursor: pointer; transition: 0.3s; background: #e3f2fd; }
+        .upload-area:hover { background: #bbdefb; border-color: #1976D2; }
+        .quiz-area { display: none; }
+        .quiz-area.active { display: block; animation: fadeIn 0.5s; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .metadata-bar { display: flex; flex-wrap: wrap; gap: 15px; background: #f1f5f9; padding: 15px; border-radius: 15px; margin-bottom: 30px; border: 1px solid #e2e8f0; }
+        .metadata-item { background: white; padding: 8px 15px; border-radius: 10px; font-weight: bold; font-size: 0.9rem; color: #475569; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .q-card { background: #fff; padding: 35px; border-radius: 25px; border-left: 10px solid var(--accent); margin-bottom: 30px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); }
+        .q-text { font-size: 1.8rem; line-height: 1.6; color: #1e293b; margin-bottom: 25px; }
+        .options-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+        .option-item { background: #f8fafc; border: 2px solid #e2e8f0; border-radius: 20px; padding: 20px; font-size: 1.4rem; cursor: pointer; transition: 0.2s; display: flex; align-items: center; gap: 15px; }
+        .option-item:hover { transform: scale(1.02); border-color: var(--primary); background: #eff6ff; }
+        .option-item.selected { background: var(--primary); color: white; border-color: var(--primary); box-shadow: 0 10px 15px -3px rgba(37, 99, 235, 0.3); }
+        .opt-letter { background: #e2e8f0; color: #1e293b; width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-weight: bold; }
+        .option-item.selected .opt-letter { background: white; color: var(--primary); }
+        .status-badge { position: fixed; bottom: 30px; right: 30px; padding: 15px 30px; border-radius: 50px; font-weight: bold; font-size: 1.1rem; color: white; z-index: 1000; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
+        .status-listening { background: #ef4444; }
+        .status-waiting { background: #64748b; }
+        .pulsing { animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
+        #recognized-text { width: 100%; height: 100px; margin-top: 20px; border-radius: 15px; background: #fffbeb; border: 1px solid #fef3c7; padding: 15px; font-size: 1.1rem; color: #92400e; box-shadow: inset 0 2px 4px rgba(0,0,0,0.05); }
+        .blank-highlight { border-bottom: 3px solid var(--accent); color: var(--accent); font-weight: bold; padding: 0 10px; }
+        .voice-hint { background: #fdf2f2; border: 1px solid #fee2e2; border-radius: 15px; padding: 20px; margin-top: 30px; font-size: 1rem; color: #991b1b; }
+        .section-tabs { display: flex; overflow-x: auto; gap: 10px; padding-bottom: 10px; margin-bottom: 20px; }
+        .tab { white-space: nowrap; padding: 10px 20px; background: #e2e8f0; border-radius: 10px; cursor: pointer; font-weight: bold; }
+        .tab.active { background: var(--primary); color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎓 Viva EX AI System</h1>
+            <p style="color: #64748b;">Powered by Gemini Multimodal & Spatial Vision</p>
+        </div>
+
+        <div id="upload-area" class="upload-area" onclick="document.getElementById('pdf-input').click()">
+            <input type="file" id="pdf-input" accept=".pdf" style="display:none">
+            <div style="font-size: 3rem; margin-bottom: 10px; pointer-events: none;">📄</div>
+            <div style="pointer-events: none;"><strong>Click anywhere inside this box to upload PDF</strong></div>
+            <small style="color: #666; display: block; margin-top: 10px; pointer-events: none;">Supported: Scanned PDFs, Images, and Text PDFs</small>
+        </div>
+
+        <div id="quiz-area" class="quiz-area">
+            <div class="section-tabs" id="tabs"></div>
+            <div class="metadata-bar" id="metadata-bar"></div>
+            <div id="question-container"></div>
+            <div id="recognized-text">🎙️ Waiting for voice command...</div>
+            <div class="voice-hint">
+                🎙️ <strong>Voice Commands:</strong> "Read" (إقرأ) | "Next" (التالي) | "Back" (السابق) | "Explain" (اشرح لي) | "Save" (حفظ)
+            </div>
+        </div>
+    </div>
+
+    <div id="status-badge" class="status-badge status-waiting">🎙️ SYSTEM IDLE</div>
+
+    <script>
+        let sessionId = null;
+        let questions = [];
+        let metadata  = {};
+        let currentIndex = 0;
+        let sectionFilter = null;
+        let isSpeaking = false;
+        let examLanguage = 'en';
+
+        function updateStatus(text, className) {
+            const b = document.getElementById('status-badge');
+            b.innerText = text;
+            b.className = 'status-badge ' + className;
+        }
+
+        function speak(text, callback) {
+            window.speechSynthesis.cancel();
+            const utter = new SpeechSynthesisUtterance(text);
+            utter.lang = examLanguage === 'ar' ? 'ar-SA' : 'en-US';
+            utter.rate = 1.0;
+            utter.onstart = () => { isSpeaking = true; updateStatus('🔊 SPEAKING...', 'status-waiting'); };
+            utter.onend = () => { isSpeaking = false; updateStatus('🎙️ LISTENING...', 'status-listening pulsing'); if (callback) callback(); };
+            window.speechSynthesis.speak(utter);
+        }
+
+        function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
+        function closeModalOutside(e) { if (e.target === document.getElementById('modal-overlay')) closeModal(); }
+
+        function readExamInstructions() {
+            let msg = examLanguage === 'ar' ? 'مرحباً بك في نظام الذكاء الاصطناعي. ' : 'Welcome to the AI System. ';
+            msg += (examLanguage === 'ar' ? 'تم استخراج ' : 'Extracted ') + questions.length + (examLanguage === 'ar' ? ' سؤال. ' : ' questions. ');
+            msg += (examLanguage === 'ar' ? 'قل اشرح لي عند الحاجة لوصف الصور أو الجداول.' : 'Say Explain for visual descriptions.');
+            speak(msg, () => setTimeout(readFullQuestion, 500));
+        }
+
+        function displayMetadata() {
+            const bar = document.getElementById('metadata-bar');
+            bar.innerHTML = '<div class="metadata-item">✅ AI Multimodal Engine Active</div>';
+        }
+
+        async function processPDF(file) {
+            document.getElementById('upload-area').style.display = 'none';
+            document.getElementById('quiz-area').classList.add('active');
+            updateStatus(examLanguage === 'ar' ? '⏳ جاري تحليل الملف بالذكاء الاصطناعي...' : '⏳ AI Analysis in progress...', 'status-listening pulsing');
+
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const res = await fetch('/api/extract_questions', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!res.ok) {
+                    const errData = await res.json();
+                    throw new Error(errData.error || 'Upload failed.');
+                }
+
+                const data = await res.json();
+                sessionId    = data.session_id;
+                questions    = data.questions;
+                metadata     = data.metadata;
+                examLanguage = data.language || 'ar';
+                currentIndex = 0;
+
+                displayMetadata();
+                displayQuestion();
+
+                startVoiceEngine();
+                setTimeout(readExamInstructions, 800);
+
+            } catch (err) {
+                alert('Error: ' + err.message);
+                document.getElementById('upload-area').style.display = 'block';
+                document.getElementById('quiz-area').classList.remove('active');
+                updateStatus('❌ Error', 'status-waiting');
+            }
+        }
+
+        function displayQuestion() {
+            const q = questions[currentIndex];
+            const cont = document.getElementById('question-container');
+            let html = `<div class="q-card">
+                <div class="q-text">${q.number}. ${q.text}</div>`;
+            if (q.type === 'mcq') {
+                html += `<div class="options-grid">`;
+                q.options.forEach(o => {
+                    html += `<div class="option-item ${q.answer === o.letter ? 'selected' : ''}">
+                        <span class="opt-letter">${o.letter.toUpperCase()}</span>
+                        <span>${o.text}</span>
+                    </div>`;
+                });
+                html += `</div>`;
+            }
+            html += `</div>`;
+            cont.innerHTML = html;
+        }
+
+        function startVoiceEngine() {
+            const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRec) return;
+            const rec = new SpeechRec();
+            rec.continuous = true;
+            rec.interimResults = true;
+            rec.lang = examLanguage === 'ar' ? 'ar-SA' : 'en-US';
+            rec.onresult = e => {
+                const last = e.results[e.results.length - 1];
+                const cmd = last[0].transcript.toLowerCase();
+                document.getElementById('recognized-text').innerText = '🎙️ Recognized: ' + cmd;
+                if (last.isFinal) processCommand(cmd);
+            };
+            rec.start();
+            speak(examLanguage === 'ar' ? 'تم تحميل الامتحان. سأقوم بقراءة السؤال الأول.' : 'Exam loaded. Reading question one.');
+        }
+
+        async function processCommand(cmd) {
+            if (isSpeaking) return;
+            if (cmd.includes('التالي') || cmd.includes('next')) { currentIndex++; displayQuestion(); readCurrent(); }
+            if (cmd.includes('اشرح') || cmd.includes('explain')) { aiExplain(); }
+            if (cmd.includes('حفظ') || cmd.includes('save')) { alert('Saving report...'); }
+        }
+
+        function readCurrent() { speak(questions[currentIndex].text); }
+
+        async function aiExplain() {
+            const q = questions[currentIndex];
+            updateStatus('🤖 AI THINKING...', 'status-waiting pulsing');
+            const res = await fetch('/api/ai_explain', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question_text: q.text, context: q.section_label, lang: examLanguage })
+            });
+            const data = await res.json();
+            speak(data.explanation);
+        }
+
+        document.getElementById('pdf-input').onchange = e => {
+            if (e.target.files[0]) processPDF(e.target.files[0]);
+        };
+    </script>
+</body>
+</html>
+'''
+
+@app.route('/')
+def index(): return render_template_string(HTML_FULL)
+
+@app.route('/api/ai_explain', methods=['POST'])
+def api_ai_explain():
+    try:
+        data = request.get_json()
+        if not GEMINI_API_KEY: return jsonify({'explanation': 'AI Key Missing'})
+        prompt = f"Explain this question spatially for a blind student in {data['lang']}: {data['question_text']}"
+        response = model.generate_content(prompt)
+        return jsonify({'explanation': response.text})
+    except Exception as e: return jsonify({'error': str(e)}), 500
+
+@app.route('/api/extract_questions', methods=['POST'])
+def api_extract_questions():
+    try:
+        if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
+        pdf_data = request.files['file'].read()
+        prompt = "Extract questions from this PDF into JSON list: number, text, type, options, section_label. Output ONLY JSON."
+        response = model.generate_content([prompt, {'mime_type': 'application/pdf', 'data': pdf_data}])
+        # 3. استخراج الـ JSON بذكاء ومرونة
+        ai_text = response.text
+        questions = []
+        
+        # محاولة البحث عن بلوك JSON في ماركداون
+        json_match = re.search(r'```json\s+(.*?)\s+```', ai_text, re.DOTALL)
+        if not json_match:
+            json_match = re.search(r'```\s+(.*?)\s+```', ai_text, re.DOTALL)
+            
+        try:
+            if json_match:
+                questions = json.loads(json_match.group(1))
+            else:
+                # إذا لم يكن هناك ماركداون، نحاول تنظيف النص واستخراجه كـ JSON خام
+                clean_json = ai_text.strip()
+                if clean_json.startswith('```'): clean_json = clean_json.replace('```', '')
+                questions = json.loads(clean_json)
+        except Exception as json_err:
+            print(f"JSON Parsing Error: {json_err}\nRaw AI Text: {ai_text}")
+            return jsonify({'error': 'AI generated invalid data format. Please try again.'}), 500
+
+        if not questions:
+            return jsonify({'error': 'No questions were found in the document.'}), 400
+
+        sid = str(uuid.uuid4())
+        sessions[sid] = {'questions': questions}
+        
+        # كشف اللغة من أول سؤال كبديل
+        lang = detect_language(questions[0].get('text', ''))
+        
+        return jsonify({
+            'success': True,
+            'session_id': sid, 
+            'questions': questions, 
+            'language': lang,
+            'total': len(questions),
+            'metadata': {'instructions': 'Extracted via AI Multimodal'}
+        })
+    except Exception as e: return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
