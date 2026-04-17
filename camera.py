@@ -1,0 +1,222 @@
+import cv2
+import numpy as np
+import pytesseract
+import subprocess
+import pyttsx3
+import pygame
+import os
+import re
+import time
+from spellchecker import SpellChecker 
+from thefuzz import process 
+from fpdf import FPDF 
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+class VivaExEngine:
+    def __init__(self):
+        pygame.mixer.init()
+        self.engine = pyttsx3.init()
+        self.engine.setProperty('rate', 150)
+        
+        self.spell = SpellChecker() 
+        
+        # قائمة المصطلحات العامة
+        self.science_terms = [
+            "Probability", "Mathematics", "Statistics", "Population", 
+            "Experiment", "Variable", "Example", "Jarash", "GPA", "Department",
+            "Router", "Network", "Protocols", "Security", "Interface"
+        ]
+        
+        # قاموس التصحيحات المباشرة (للأخطاء المتكررة من الكاميرا)
+        self.direct_corrections = {
+            "tnat": "that", "resenos": "reaches", "Rowers": "Routers",
+            "treinrre": "traffic", "vans": "VPNs", "cos": "QoS",
+            "Quolty": "Quality", "secure": "security", "fooling": "Cooling",
+            "lactate": "facilitates"
+        }
+        
+    def speak_piper(self, text, lang="en", speed=1.5):
+        print(f"🎙️ Piper is speaking at speed {speed}...")
+        
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        piper_exe = os.path.join(base_dir, "piper", "piper.exe")
+        
+        model_name = "ar_JO-hamza-medium.onnx" if lang == "ar" else "en_US-lessac-medium.onnx"
+        model_path = os.path.join(base_dir, "model", model_name)
+        output_wav = os.path.join(base_dir, "speech_output.wav")
+
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.unload()
+
+            process = subprocess.run(
+                [piper_exe, "--model", model_path, "--output_file", output_wav, "--length_scale", str(speed)],
+                input=text.encode('utf-8'),
+                capture_output=True,
+                check=True
+            )
+            
+            if os.path.exists(output_wav):
+                pygame.mixer.music.load(output_wav)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    pygame.time.Clock().tick(10)
+        except Exception as e:
+            print(f"❌ خطأ في السرد باستخدام Piper، سيتم استخدام البديل: {e}")
+            self.speak_offline(text)
+            
+    def speak_offline(self, text):
+        print(f"🤖 نطق أوفلاين: {text[:50]}...")
+        self.engine.say(text)
+        self.engine.runAndWait()
+
+    def advanced_correction(self, raw_text):
+        print("🧠 جاري التدقيق اللغوي وحماية المصطلحات...")
+        lines = raw_text.split('\n')
+        final_lines = []
+
+        for line in lines:
+            if not line.strip(): continue
+            
+            # 1. تصحيح مباشر للكلمات الشائعة الخطأ
+            for wrong, correct in self.direct_corrections.items():
+                if wrong in line:
+                    line = line.replace(wrong, correct)
+
+            words = line.split()
+            corrected_words = []
+            
+            for word in words:
+                clean_word = re.sub(r'[^\w]', '', word)
+                
+                # 2. حماية الكلمات القصيرة والأرقام و(أهم شيء) الكلمات التي تحتوي حروف كبيرة كلياً (المختصرات)
+                if not clean_word or len(clean_word) < 3 or clean_word.isdigit() or word.isupper():
+                    corrected_words.append(word)
+                    continue
+
+                # 3. التدقيق الذكي لباقي الكلمات
+                best_match, score = process.extractOne(clean_word, self.science_terms)
+                if score > 90: 
+                    corrected_words.append(best_match)
+                else:
+                    corr = self.spell.correction(word)
+                    corrected_words.append(corr if corr else word)
+            
+            final_lines.append(" ".join(corrected_words))
+            
+        return "\n".join(final_lines)
+
+    def extract_text(self, image):
+       
+        # ... (باقي الكود كما هو بدون تغيير)
+        print("🛠️ جاري المعالجة الرقمية (مع التكبير السحري للضعف)...")
+        
+        # 1. تدوير الصورة لضبط الزاوية
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+
+        # 2. 🌟 السر الجديد: تكبير الصورة للضعف لتنعيم حواف الحروف ومنع الهلوسة
+        image = cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+        # 3. تحويل لرمادي
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # 4. العتبة التكيفية (رقم 15 ممتاز مع الصور الكبيرة)
+        processed = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                          cv2.THRESH_BINARY, 21, 15)
+
+        # إضافة إطار أبيض
+        processed = cv2.copyMakeBorder(processed, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+        
+        cv2.imwrite("debug_ocr_view.jpg", processed)
+        
+        print("📖 استخراج النصوص أوفلاين...")
+        custom_config = r'--oem 3 --psm 6'
+        raw_text = pytesseract.image_to_string(processed, lang='eng', config=custom_config)
+
+        # إرسال النص لدالة التصحيح (والتي ستلتقط أي أخطاء متبقية)
+        return self.advanced_correction(raw_text)
+
+    def calculate_sharpness(self, image):
+        return cv2.Laplacian(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+
+    def capture_best_frame(self):
+        cap = cv2.VideoCapture(0)
+
+        if not cap.isOpened():
+            print("❌ لم يتم العثور على الكاميرا! تأكد من إعدادات الكاميرا في اللابتوب.")
+            return None
+
+        print("\n" + "="*50)
+        print("📷 يتم الآن عرض الكاميرا. اضبط الزاوية ثم اضغط على 'Space' للالتقاط.")
+        print("="*50 + "\n")
+        
+        frames_buffer = [] 
+        
+        for _ in range(5):
+            cap.read()
+            
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("⚠️ الكاميرا فصلت... جاري معالجة ما تم التقاطه.")
+                break
+                
+            frames_buffer.append(frame.copy())
+            if len(frames_buffer) > 5:
+                frames_buffer.pop(0)
+                
+            display_frame = frame.copy()
+            cv2.putText(display_frame, "Adjust Camera. Press SPACE to capture, or 'q' to quit.", 
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            cv2.imshow("Camera Preview - VIVA-Ex", display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord(' '):  
+                print("📸 تم الالتقاط!")
+                break
+            elif key == ord('q'): 
+                cap.release()
+                cv2.destroyAllWindows()
+                return None
+                
+        cap.release()
+        cv2.destroyAllWindows()
+        
+        if not frames_buffer: 
+            return None
+            
+        scores = [self.calculate_sharpness(f) for f in frames_buffer]
+        return frames_buffer[np.argmax(scores)]
+
+    def save_to_pdf(self, text, filename="Extracted_Document.pdf"):
+        print("📄 جاري إنشاء ملف الـ PDF...")
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_font("Helvetica", size=12)
+        
+        for line in text.split('\n'):
+            safe_text = line.encode('latin-1', 'replace').decode('latin-1')
+            pdf.multi_cell(0, 10, safe_text)
+            
+        pdf.output(filename)
+        print(f"✅ تم حفظ الملف بنجاح باسم: {filename}")
+
+
+if __name__ == "__main__":
+    viva = VivaExEngine()
+    
+    img = viva.capture_best_frame()
+    
+    if img is not None:
+        text_output = viva.extract_text(img)
+        print("\n" + "="*60)
+        print(f"📝 النتيجة النهائية:\n{text_output}")
+        print("="*60 + "\n")
+        
+        viva.save_to_pdf(text_output)
+        viva.speak_piper(text_output, lang="en") 
+    else:
+        print("❌ تم الإلغاء أو فشل التقاط الصورة!")
